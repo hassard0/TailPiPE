@@ -140,6 +140,36 @@ sudo networkctl renew <iface>
 sudo nmcli connection down "<conn>" && sudo nmcli connection up "<conn>"
 ```
 
+## Optional: on-device LCD dashboard
+
+If you've attached a Waveshare-compatible 3.5" SPI touchscreen (ILI9486 +
+XPT2046 — e.g. the Waveshare 3.5", GeekPi 3.5", or any clone of either), you
+can install a small dashboard that shows:
+
+- Hostname, LAN IP, tailnet IP
+- Live RX/TX bandwidth for `wlan0`, `eth0`, and `tailscale0`, with 60-second
+  spark lines
+- Current DHCP leases (IP / name / MAC) — same list dnsmasq hands out
+- A wifi icon in the top-right corner with signal strength; tap it to scan
+  networks and tap an SSID to connect (on-screen keyboard for the password)
+
+```bash
+# If the LCD overlay is not yet enabled (no /dev/fb1):
+sudo ./install-dashboard.sh --with-driver
+sudo reboot
+
+# If the LCD driver is already set up:
+sudo ./install-dashboard.sh
+```
+
+The systemd unit is gated on `ConditionPathExists=/dev/fb1`, so installing
+the dashboard on a Pi without an LCD is safe — the service stays dormant
+until the framebuffer appears, and you can flip the LCD on/off without
+reconfiguring anything.
+
+Rendering goes directly to `/dev/fb1` via Pillow (no X11, no SDL) and touch
+comes from `python-evdev`. About 20 MB of RAM at idle.
+
 ## Uninstall
 
 ```bash

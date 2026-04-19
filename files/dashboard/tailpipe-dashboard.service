@@ -1,0 +1,17 @@
+[Unit]
+Description=TailPiPE LCD Dashboard
+After=network-online.target NetworkManager.service tailscaled.service
+Wants=network-online.target
+ConditionPathExists=/dev/fb1
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tailpipe-dashboard
+Restart=on-failure
+RestartSec=5
+User=root
+# Ensure evdev and framebuffer access
+SupplementaryGroups=input video
+
+[Install]
+WantedBy=multi-user.target

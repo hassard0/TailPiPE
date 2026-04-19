@@ -7,3 +7,6 @@ files/ts-hosts-update.service text eol=lf
 files/ts-hosts-update.timer   text eol=lf
 files/99-tailpipe-sysctl.conf text eol=lf
 files/dnsmasq-tailpipe.conf.tmpl text eol=lf
+files/dashboard/dashboard.py                  text eol=lf
+files/dashboard/tailpipe-dashboard.service    text eol=lf
+install-dashboard.sh                          text eol=lf
