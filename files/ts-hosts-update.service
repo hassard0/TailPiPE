@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh /etc/hosts.tailscale from tailscale status
+After=tailscaled.service
+Requires=tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ts-hosts-update

@@ -1,0 +1,32 @@
+#!/bin/bash
+# Write tailnet peer hostnames to /etc/hosts.tailscale so dnsmasq can serve
+# them authoritatively to downstream DHCP clients. Reloads dnsmasq on change.
+set -eu
+
+OUT=/etc/hosts.tailscale
+TMP=$(mktemp)
+
+tailscale status --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+nodes = []
+if d.get("Self"): nodes.append(d["Self"])
+nodes += list((d.get("Peer") or {}).values())
+for n in nodes:
+    dns = (n.get("DNSName","") or "").rstrip(".")
+    if not dns:
+        continue
+    short = dns.split(".",1)[0].lower()
+    for ip in n.get("TailscaleIPs") or []:
+        if ":" in ip:
+            continue
+        print(f"{ip} {short} {dns}")
+' > "$TMP"
+
+if ! cmp -s "$TMP" "$OUT" 2>/dev/null; then
+  mv "$TMP" "$OUT"
+  chmod 644 "$OUT"
+  systemctl kill -s HUP dnsmasq 2>/dev/null || true
+else
+  rm -f "$TMP"
+fi

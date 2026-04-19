@@ -1,0 +1,30 @@
+# Managed by TailPiPE installer.
+# Template variables are substituted by install.sh:
+#   __LAN_IFACE__        downlink interface (e.g. eth0)
+#   __LAN_IP__           static IPv4 on that interface (e.g. 192.168.50.1)
+#   __LAN_NETMASK__      netmask for that subnet (e.g. 255.255.255.0)
+#   __DHCP_START__       first DHCP address (e.g. 192.168.50.100)
+#   __DHCP_END__         last DHCP address (e.g. 192.168.50.200)
+#   __MAGICDNS_SUFFIX__  tailnet MagicDNS suffix (e.g. tailXXXXXX.ts.net)
+
+interface=__LAN_IFACE__
+bind-dynamic
+except-interface=lo
+listen-address=__LAN_IP__
+
+domain-needed
+bogus-priv
+
+dhcp-range=__DHCP_START__,__DHCP_END__,__LAN_NETMASK__,12h
+dhcp-option=option:router,__LAN_IP__
+dhcp-option=option:dns-server,__LAN_IP__
+dhcp-option=option:domain-name,__MAGICDNS_SUFFIX__
+dhcp-option=option:domain-search,__MAGICDNS_SUFFIX__
+dhcp-authoritative
+
+# Forward tailnet MagicDNS queries to tailscale's internal resolver
+server=/__MAGICDNS_SUFFIX__/100.100.100.100
+server=/ts.net/100.100.100.100
+
+# Authoritative short-name records for tailnet peers (maintained by ts-hosts-update.timer)
+addn-hosts=/etc/hosts.tailscale

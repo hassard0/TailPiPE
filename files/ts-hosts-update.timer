@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically refresh tailnet hosts file
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5min
+Unit=ts-hosts-update.service
+
+[Install]
+WantedBy=timers.target
