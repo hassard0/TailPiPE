@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.sh        text eol=lf
+install.sh  text eol=lf
+uninstall.sh text eol=lf
+files/ts-hosts-update         text eol=lf
+files/ts-hosts-update.service text eol=lf
+files/ts-hosts-update.timer   text eol=lf
+files/99-tailpipe-sysctl.conf text eol=lf
+files/dnsmasq-tailpipe.conf.tmpl text eol=lf
