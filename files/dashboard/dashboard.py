@@ -514,6 +514,67 @@ def read_leases():
         pass
     return out
 
+def read_tailnet_hosts(path='/etc/hosts.tailscale'):
+    """Return {ip: shortname} parsed from the addn-hosts file so destinations
+    shown in the clients panel can be labelled with tailnet hostnames rather
+    than bare 100.x IPs."""
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2 and ':' not in parts[0]:
+                    out[parts[0]] = parts[1]
+    except OSError:
+        pass
+    return out
+
+def read_client_flows(lan_prefix):
+    """Group active conntrack flows by originating LAN client.
+
+    Returns {client_ip: {'flows': int, 'protos': set, 'dests': Counter}},
+    where dests counts unique destination IPs. nf_conntrack lists both the
+    "original" tuple (client -> peer) and the "reply" tuple (peer -> pi's
+    uplink IP after SNAT); parsing only the first src=/dst= per line gives
+    us the original direction, which is what we want to attribute to a
+    client."""
+    from collections import Counter
+    groups = {}
+    try:
+        with open('/proc/net/nf_conntrack') as f:
+            for line in f:
+                # skip ipv6 for now; field 0 is family, field 2 is proto
+                parts = line.split()
+                if not parts or parts[0] != 'ipv4':
+                    continue
+                proto = parts[2] if len(parts) > 2 else ''
+                src = dst = None
+                for tok in parts:
+                    if src is None and tok.startswith('src='):
+                        src = tok[4:]
+                    elif dst is None and tok.startswith('dst='):
+                        dst = tok[4:]
+                    if src and dst:
+                        break
+                if not src or not dst:
+                    continue
+                if not src.startswith(lan_prefix):
+                    continue
+                # ignore chatter to the gateway/broadcast itself
+                if dst.endswith('.255'):
+                    continue
+                g = groups.setdefault(src, {'flows': 0, 'protos': set(),
+                                            'dests': Counter()})
+                g['flows'] += 1
+                g['protos'].add(proto)
+                g['dests'][dst] += 1
+    except OSError:
+        pass
+    return groups
+
 # ---- rendering --------------------------------------------------------------
 
 W, H = 480, 320
@@ -582,14 +643,32 @@ def draw_bandwidth(d, state):
 def draw_clients(d, state):
     y0 = 118
     leases = state['leases']
+    flows = state.get('client_flows', {})
+    ts_hosts = state.get('ts_hosts', {})
     d.text((8, y0), f'CONNECTED  ({len(leases)})', font=F_MD, fill=ACCENT)
-    d.text((160, y0 + 2), 'ip              name                mac', font=F_SM, fill=DIM)
+    d.text((160, y0 + 2), 'ip              name                    flows',
+           font=F_SM, fill=DIM)
     y = y0 + 20
-    for l in leases[:11]:
+    # Up to 5 clients at 2 lines each (~28 px) fits below y=320.
+    for l in leases[:5]:
         name = l['name'] if l['name'] != '*' else '(unknown)'
-        name = name if len(name) <= 18 else name[:17] + '.'
-        d.text((8, y), f'{l["ip"]:<15} {name:<19} {l["mac"]}', font=F_SM, fill=FG)
-        y += 14
+        name = name if len(name) <= 20 else name[:19] + '.'
+        g = flows.get(l['ip'])
+        if g:
+            proto_tag = ','.join(sorted(g['protos']))[:12]
+            d.text((8, y), f'{l["ip"]:<15} {name:<22} {g["flows"]}/{proto_tag}',
+                   font=F_SM, fill=FG)
+            # top destinations, name-resolved where possible
+            top = [f'{ts_hosts.get(ip, ip)}' for ip, _ in g['dests'].most_common(4)]
+            line = ', '.join(top)
+            if len(line) > 60:
+                line = line[:59] + '.'
+            d.text((22, y + 13), f'-> {line}', font=F_SM, fill=DIM)
+        else:
+            d.text((8, y), f'{l["ip"]:<15} {name:<22} idle',
+                   font=F_SM, fill=FG)
+            d.text((22, y + 13), l['mac'], font=F_SM, fill=DIM)
+        y += 27
     if not leases:
         d.text((8, y), '(no active leases)', font=F_SM, fill=DIM)
 
@@ -893,6 +972,12 @@ def main():
         if now - last_slow >= 3:
             state['lan_ip'] = ip4(LAN_IFACE); state['ts_ip'] = tailscale_ip()
             state['wifi'] = wifi_status(); state['leases'] = read_leases()
+            # Derive the LAN prefix from LAN_IP (trim the last octet) so flow
+            # filtering works regardless of subnet customisation.
+            lan_prefix = '.'.join(state['lan_ip'].split('.')[:3]) + '.' \
+                if state['lan_ip'] not in ('-', '') else '192.168.50.'
+            state['client_flows'] = read_client_flows(lan_prefix)
+            state['ts_hosts'] = read_tailnet_hosts()
             last_slow = now
         if touch:
             for kind, sx, sy, rx, ry in touch.poll():
