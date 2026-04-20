@@ -17,8 +17,9 @@
 #   --rotate N        overlay rotation (0, 90, 180, 270). Default 90.
 set -euo pipefail
 
-OVERLAY="waveshare35a"
+OVERLAY="piscreen"
 ROTATE="90"
+OVERLAY_EXTRA="speed=24000000,fps=30"
 WITH_DRIVER=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -45,8 +46,16 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
   python3 python3-pil python3-evdev python3-numpy fonts-dejavu-core
 
 log "Installing dashboard script + systemd unit"
-install -m 0755 "$FILES/dashboard.py"                /usr/local/bin/tailpipe-dashboard
-install -m 0644 "$FILES/tailpipe-dashboard.service"  /etc/systemd/system/tailpipe-dashboard.service
+# We avoid 'install' here: on some Pi OS images it has produced 0-byte
+# targets when invoked in rapid succession (fsync/tmpfile race on vfat).
+# Plain cp has been reliable.
+cp    "$FILES/dashboard.py"                /usr/local/bin/tailpipe-dashboard
+chmod 0755                                 /usr/local/bin/tailpipe-dashboard
+cp    "$FILES/tailpipe-dashboard.service"  /etc/systemd/system/tailpipe-dashboard.service
+chmod 0644                                 /etc/systemd/system/tailpipe-dashboard.service
+# Verify the copies actually landed — diagnostics-friendly fail path.
+[[ -s /usr/local/bin/tailpipe-dashboard ]] || { echo "copy produced empty dashboard binary" >&2; exit 1; }
+[[ -s /etc/systemd/system/tailpipe-dashboard.service ]] || { echo "copy produced empty service unit" >&2; exit 1; }
 systemctl daemon-reload
 systemctl enable tailpipe-dashboard.service
 
@@ -57,15 +66,18 @@ if [[ $WITH_DRIVER -eq 1 ]]; then
   [[ -f "$CFG" ]] || { echo "cannot find config.txt" >&2; exit 1; }
 
   LINE="dtoverlay=${OVERLAY},rotate=${ROTATE}"
+  [[ -n "${OVERLAY_EXTRA:-}" ]] && LINE="${LINE},${OVERLAY_EXTRA}"
   if grep -q "^dtoverlay=${OVERLAY}" "$CFG"; then
     log "overlay already present in $CFG"
   else
     log "adding '$LINE' to $CFG"
     printf '\n# TailPiPE: 3.5" SPI LCD\n%s\n' "$LINE" >> "$CFG"
-    # SPI must be on for ILI9486/XPT2046 communication
     if ! grep -qE '^dtparam=spi=on' "$CFG"; then
       echo 'dtparam=spi=on' >> "$CFG"
     fi
+    # Force vfat to flush — we've seen the boot partition lose a fresh
+    # append across power-cycles without this.
+    sync
     REBOOT_NEEDED=1
   fi
 fi

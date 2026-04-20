@@ -2,11 +2,13 @@
 Description=TailPiPE LCD Dashboard
 After=network-online.target NetworkManager.service tailscaled.service
 Wants=network-online.target
-ConditionPathExists=/dev/fb1
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/tailpipe-dashboard
+# Auto-detects the LCD fbdev; override with TAILPIPE_FB=/dev/fbN if needed.
+Environment=TAILPIPE_FB=auto
+# If no LCD is found, the script exits 0 and systemd stops restarting.
 Restart=on-failure
 RestartSec=5
 User=root

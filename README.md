@@ -162,10 +162,16 @@ sudo reboot
 sudo ./install-dashboard.sh
 ```
 
-The systemd unit is gated on `ConditionPathExists=/dev/fb1`, so installing
-the dashboard on a Pi without an LCD is safe — the service stays dormant
-until the framebuffer appears, and you can flip the LCD on/off without
-reconfiguring anything.
+If no LCD framebuffer is present at startup, the dashboard script exits
+cleanly with status 0 and systemd does not retry. After physically attaching
+the LCD (and adding the overlay), `systemctl restart tailpipe-dashboard`
+brings it up without touching anything else.
+
+The framebuffer device is auto-detected by scanning `/sys/class/graphics/fbN/name`
+for the `fb_ili9486` / `fbtft` driver, so the same build works whether the
+LCD lands on `fb0` (Pi OS Trixie with KMS-only HDMI) or `fb1` (older images
+with a legacy HDMI fbdev). Override by setting `TAILPIPE_FB=/dev/fbN` in the
+service unit if needed.
 
 Rendering goes directly to `/dev/fb1` via Pillow (no X11, no SDL) and touch
 comes from `python-evdev`. About 20 MB of RAM at idle.

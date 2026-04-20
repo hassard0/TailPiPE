@@ -17,7 +17,28 @@ from evdev import ecodes
 
 # ---- config -----------------------------------------------------------------
 
-FB_DEV = os.environ.get('TAILPIPE_FB', '/dev/fb1')
+def _find_lcd_fb():
+    """Pick the framebuffer backed by the ILI9486 SPI driver.
+
+    On Pi OS Trixie (KMS-only HDMI) the SPI LCD tends to register as fb0,
+    while on older images with a legacy HDMI fbdev it shows up as fb1. Scan
+    /sys/class/graphics/fbN/name and match the fbtft driver.
+    """
+    import glob
+    for sys_path in sorted(glob.glob('/sys/class/graphics/fb[0-9]*')):
+        try:
+            with open(os.path.join(sys_path, 'name')) as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        if 'ili9486' in name.lower() or 'fbtft' in name.lower():
+            return '/dev/' + os.path.basename(sys_path)
+    # Fallback: if there's exactly one fbdev, use it
+    devs = sorted(glob.glob('/dev/fb[0-9]*'))
+    return devs[0] if len(devs) == 1 else None
+
+_env_fb = os.environ.get('TAILPIPE_FB', 'auto')
+FB_DEV = _find_lcd_fb() if _env_fb == 'auto' else _env_fb
 LAN_IFACE = os.environ.get('TAILPIPE_LAN_IFACE', 'eth0')
 WAN_IFACE = os.environ.get('TAILPIPE_WAN_IFACE', 'wlan0')
 TS_IFACE = 'tailscale0'
@@ -464,8 +485,8 @@ def set_status(state, msg, secs):
 # ---- main -------------------------------------------------------------------
 
 def main():
-    if not os.path.exists(FB_DEV):
-        print(f'{FB_DEV} not present; exiting.', file=sys.stderr); sys.exit(0)
+    if not FB_DEV or not os.path.exists(FB_DEV):
+        print('no LCD framebuffer detected; exiting.', file=sys.stderr); sys.exit(0)
     fb = FB(FB_DEV)
     touch_dev = find_touch()
     touch = Touch(touch_dev, W, H) if touch_dev else None
