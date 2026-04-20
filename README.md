@@ -154,6 +154,9 @@ If you've attached a Waveshare-compatible 3.5" SPI touchscreen
 (ILI9486 + XPT2046 — e.g. Waveshare 3.5", GeekPi 3.5", or any clone) you can
 install a local touch UI. It renders directly to the LCD framebuffer through
 Pillow (no X11, no SDL) and reads touch via `python-evdev`. ~20 MB of RAM.
+Flow data is read from the `conntrack` CLI (netlink) — Pi OS Trixie is built
+without `CONFIG_NF_CONNTRACK_PROCFS`, so `/proc/net/nf_conntrack` isn't an
+option; the installer pulls `conntrack-tools` for this.
 
 ### What the screen shows
 
