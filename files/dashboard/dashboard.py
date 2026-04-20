@@ -110,9 +110,18 @@ class Touch:
     480x320 landscape origin matches finger presses on a screen configured
     with `dtoverlay=waveshare35a,rotate=90`.
     """
-    def __init__(self, dev, screen_w, screen_h, rotate=90):
+    def __init__(self, dev, screen_w, screen_h, rotate=None):
         self.dev = dev
         self.w = screen_w; self.h = screen_h
+        # Default: rotate=270. The piscreen overlay sets touchscreen-swapped-x-y
+        # in device tree; combined with the display's rotate=90, the touch
+        # axes come out rotated 270 relative to the rendered frame. Override
+        # with TAILPIPE_TOUCH_ROTATE=0|90|180|270 if your panel differs.
+        if rotate is None:
+            try:
+                rotate = int(os.environ.get('TAILPIPE_TOUCH_ROTATE', '270'))
+            except ValueError:
+                rotate = 270
         self.rotate = rotate
         ax = dict(dev.capabilities()[ecodes.EV_ABS])
         self.xmin, self.xmax = ax[ecodes.ABS_X].min, ax[ecodes.ABS_X].max
