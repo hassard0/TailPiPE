@@ -483,8 +483,25 @@ def handle_main_tap(state, x, y):
         state['view'] = 'wifi'; state['scanning'] = True
         threading.Thread(target=_do_scan, args=(state,), daemon=True).start()
 
+CAL_MAX_ERR_PX = 35  # reject calibration if any target residual exceeds this
+
 def draw_calibration(d, state):
     d.rectangle([0, 0, W, H], fill=BG)
+    d.text((W//2 - 100, 24), 'TOUCH CALIBRATION', font=F_LG, fill=FG)
+    if not state.get('cal_started'):
+        # Start screen. Any tap begins; the button is visual, not a hitbox,
+        # so this still works even when the current mapping is badly wrong.
+        btn = (W//2 - 90, H//2 - 30, W//2 + 90, H//2 + 30)
+        d.rectangle(btn, fill=(40, 110, 40))
+        d.rectangle(btn, outline=ACCENT, width=2)
+        d.text((W//2 - 32, H//2 - 10), 'START', font=F_LG, fill=FG)
+        d.text((W//2 - 175, H - 36),
+               'tap anywhere to begin — 5 targets, tap each center precisely',
+               font=F_SM, fill=DIM)
+        d.text((W//2 - 120, H - 18),
+               'any miss > 35 px fails the run and asks you to retry',
+               font=F_SM, fill=DIM)
+        return
     idx = state.get('cal_idx', 0)
     if idx >= len(CAL_TARGETS):
         return
@@ -493,26 +510,44 @@ def draw_calibration(d, state):
     d.line([tx-20, ty, tx+20, ty], fill=ACCENT, width=1)
     d.line([tx, ty-20, tx, ty+20], fill=ACCENT, width=1)
     d.ellipse([tx-2, ty-2, tx+2, ty+2], fill=ACCENT)
-    d.text((W//2 - 90, H//2 - 20), 'TOUCH CALIBRATION', font=F_LG, fill=FG)
-    d.text((W//2 - 70, H//2 + 6), f'tap target {idx + 1} of {len(CAL_TARGETS)}',
+    d.text((W//2 - 70, H//2 + 20), f'target {idx + 1} of {len(CAL_TARGETS)}',
            font=F_MD, fill=DIM)
-    d.text((W//2 - 150, H - 18), '5 rapid taps any time to restart',
-           font=F_SM, fill=DIM)
+
+def _finish_calibration(state):
+    pts = state.get('cal_raw_pts', [])
+    try:
+        M = compute_affine(CAL_TARGETS, pts)
+        max_err = 0.0
+        for (rx_i, ry_i), (sx_t, sy_t) in zip(pts, CAL_TARGETS):
+            pred = M @ np.array([rx_i, ry_i, 1.0])
+            max_err = max(max_err, float(np.hypot(pred[0] - sx_t, pred[1] - sy_t)))
+        if max_err > CAL_MAX_ERR_PX:
+            set_status(state,
+                       f'calibration failed — {max_err:.0f} px error. 5 taps to retry',
+                       7)
+        else:
+            save_calibration(M)
+            state['touch'].set_matrix(M)
+            set_status(state, f'calibration saved (max err {max_err:.0f} px)', 4)
+    except Exception as e:
+        set_status(state, f'calibration failed: {e}'[:60], 6)
+    state['view'] = 'main'
+    for k in ('cal_started', 'cal_raw_pts', 'cal_idx'):
+        state.pop(k, None)
 
 def handle_calibration_tap(state, sx, sy, rx, ry):
+    if not state.get('cal_started'):
+        # Accept any tap as "begin" — safer than a hitbox while mapping
+        # may be completely wrong.
+        state['cal_started'] = True
+        state['cal_idx'] = 0
+        state['cal_raw_pts'] = []
+        return
     pts = state.setdefault('cal_raw_pts', [])
     pts.append((rx, ry))
     state['cal_idx'] = state.get('cal_idx', 0) + 1
     if state['cal_idx'] >= len(CAL_TARGETS):
-        try:
-            M = compute_affine(CAL_TARGETS, pts)
-            save_calibration(M)
-            state['touch'].set_matrix(M)
-            set_status(state, 'calibration saved', 4)
-        except Exception as e:
-            set_status(state, f'calibration failed: {e}'[:50], 5)
-        state['view'] = 'main'
-        state.pop('cal_raw_pts', None); state.pop('cal_idx', None)
+        _finish_calibration(state)
 
 def handle_wifi_tap(state, x, y):
     if x >= 436 and y < 32:
@@ -605,23 +640,23 @@ def main():
             last_slow = now
         if touch:
             for kind, sx, sy, rx, ry in touch.poll():
-                # Secret gesture: 5 taps within 2.5 s opens the calibration
-                # wizard. Works from any view, so it's recoverable even when
-                # touch mapping is badly wrong. Resets the running window on
-                # entry so you don't accidentally re-trigger.
+                # 5 rapid taps (within 2.5 s) opens the calibration wizard.
+                # Counted from any view except calibrate itself — so it
+                # recovers when touch mapping is badly wrong, but you can't
+                # accidentally reset the wizard mid-run.
                 tnow = time.monotonic()
-                recent = state.setdefault('recent_taps', [])
-                recent.append(tnow)
-                cutoff = tnow - 2.5
-                while recent and recent[0] < cutoff:
-                    recent.pop(0)
-                if len(recent) >= 5:
-                    state['recent_taps'] = []
-                    state['view'] = 'calibrate'
-                    state['cal_idx'] = 0
-                    state['cal_raw_pts'] = []
-                    set_status(state, 'calibration — tap each crosshair', 4)
-                    continue
+                if state['view'] != 'calibrate':
+                    recent = state.setdefault('recent_taps', [])
+                    recent.append(tnow)
+                    cutoff = tnow - 2.5
+                    while recent and recent[0] < cutoff:
+                        recent.pop(0)
+                    if len(recent) >= 5:
+                        state['recent_taps'] = []
+                        state['view'] = 'calibrate'
+                        state['cal_started'] = False
+                        set_status(state, 'calibration — tap start to begin', 4)
+                        continue
                 if state['view'] == 'main':
                     handle_main_tap(state, sx, sy)
                 elif state['view'] == 'wifi':
