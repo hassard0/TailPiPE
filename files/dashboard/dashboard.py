@@ -725,10 +725,22 @@ def draw_clients(d, state):
             proto_tag = ','.join(sorted(g['protos']))[:12]
             d.text((8, y), f'{l["ip"]:<15} {name:<22} {g["flows"]}/{proto_tag}',
                    font=F_SM, fill=FG)
-            top = [resolve_display_name(ip, names) for ip, _ in g['dests'].most_common(4)]
-            line = ', '.join(top)
-            if len(line) > 60:
-                line = line[:59] + '.'
+            # Show named destinations first (tailnet peers, LAN clients,
+            # self) so a single icmp flow to pluto isn't hidden behind a
+            # browser's wall of CDN hits. Then fill the remaining line
+            # width with whatever's left, ordered by flow count.
+            ordered = g['dests'].most_common()
+            named = [ip for ip, _ in ordered if ip in names]
+            others = [ip for ip, _ in ordered if ip not in names]
+            line = ''
+            for ip in named + others:
+                label = resolve_display_name(ip, names)
+                sep = ', ' if line else ''
+                if len(line) + len(sep) + len(label) > 60:
+                    if line:
+                        line += ', ...'
+                    break
+                line += sep + label
             d.text((22, y + 13), f'-> {line}', font=F_SM, fill=DIM)
         else:
             d.text((8, y), f'{l["ip"]:<15} {name:<22} idle',
