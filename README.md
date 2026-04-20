@@ -160,7 +160,13 @@ Pillow (no X11, no SDL) and reads touch via `python-evdev`. ~20 MB of RAM.
 - **Header**: hostname, LAN IP, tailnet IP, current wifi SSID + signal bars.
 - **Bandwidth**: live RX/TX for `wlan0`, `eth0`, and `tailscale0` with
   60-second spark lines.
-- **Connected clients**: current dnsmasq DHCP leases (IP / name / MAC).
+- **Connected clients**: current dnsmasq DHCP leases plus a live per-client
+  activity line showing flow count, protocols, and the top destinations.
+  Destinations are name-resolved — tailnet peers via `/etc/hosts.tailscale`
+  (`100.67.189.24` → `pluto`), LAN clients via their DHCP hostname, and
+  anything else via background rDNS (`44.215.138.159` →
+  `amazonaws.com`). Named destinations sort ahead of raw IPs so a single
+  `ping <peer>` doesn't get buried under the browser's CDN traffic.
 - **Tap top-left of the header** → QR-code-driven phone UI for Tailscale
   disconnect / re-auth (details below).
 - **Tap top-right of the header** → wifi picker with on-screen keyboard.
