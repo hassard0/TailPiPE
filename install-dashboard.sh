@@ -19,7 +19,11 @@ set -euo pipefail
 
 OVERLAY="piscreen"
 ROTATE="90"
-OVERLAY_EXTRA="speed=24000000,fps=30"
+# xohms=60 is the critical bit on most ILI9486/XPT2046 clones: the overlay
+# default (~400) leaves pressure readings near zero, so the kernel driver
+# filters every tap as invalid. 60 is in the 60-100 range the fbtft docs
+# recommend for these panels.
+OVERLAY_EXTRA="speed=24000000,fps=30,xohms=60"
 WITH_DRIVER=0
 while [[ $# -gt 0 ]]; do
   case "$1" in

@@ -278,14 +278,16 @@ def draw_wifi_icon(d, x, y, signal):
 
 def draw_header(d, state):
     d.rectangle([0, 0, W, 34], fill=PANEL)
+    # Visual hint: subtly highlight the whole tappable wifi zone (x=290..W).
+    d.rectangle([290, 0, W, 34], fill=(28, 34, 50))
     d.text((8, 4), os.uname().nodename, font=F_MD, fill=FG)
     d.text((8, 20), f'lan {state["lan_ip"]}   tailnet {state["ts_ip"]}',
            font=F_SM, fill=DIM)
     ssid, sig = state['wifi']
     if ssid:
         s = ssid if len(ssid) <= 18 else ssid[:17] + '.'
-        d.text((300, 4), s, font=F_SM, fill=FG)
-        d.text((300, 18), f'{sig}%', font=F_SM, fill=DIM)
+        d.text((298, 4), s, font=F_SM, fill=FG)
+        d.text((298, 18), f'{sig}%', font=F_SM, fill=DIM)
     draw_wifi_icon(d, 448, 8, sig)
 
 def draw_bandwidth(d, state):
@@ -418,7 +420,9 @@ def draw_status(d, state):
 # ---- touch handlers ---------------------------------------------------------
 
 def handle_main_tap(state, x, y):
-    if y < 34 and x > 430:  # wifi icon / top-right
+    # Whole top-right region (SSID text + signal% + bars + icon) opens the
+    # wifi picker — not just the 4-bar icon.
+    if y < 34 and x > 290:
         state['view'] = 'wifi'; state['scanning'] = True
         threading.Thread(target=_do_scan, args=(state,), daemon=True).start()
 
