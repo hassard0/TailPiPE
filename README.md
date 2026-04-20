@@ -176,6 +176,24 @@ service unit if needed.
 Rendering goes directly to `/dev/fb1` via Pillow (no X11, no SDL) and touch
 comes from `python-evdev`. About 20 MB of RAM at idle.
 
+### Tailscale control (QR + phone)
+
+Tapping the **top-left of the header** (hostname / LAN IP / tailnet IP area)
+opens a QR-code view. Scan it with a phone on the pi's wifi uplink and
+you'll land on a small HTML page served by the dashboard that lets you:
+
+- Disconnect this node from the current tailnet
+- Re-authenticate to a different tailnet (the page will then show a
+  clickable login URL and an auxiliary QR code for the tailscale auth flow,
+  so you can sign in on whichever device owns the new account)
+
+The page is gated by a single-use session token embedded in the QR URL —
+generated when the view opens and invalidated when it closes, so neighbours
+on the same wifi can't hit the endpoint without seeing the LCD. The server
+listens on port 8080 of every interface by default; set
+`TAILPIPE_TS_BIND=<lan_ip>` (and `TAILPIPE_TS_PORT=<n>`) in the service
+unit to restrict it.
+
 ### Touch calibration
 
 If taps land in the wrong place (common — axes and offsets vary by panel

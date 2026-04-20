@@ -9,12 +9,14 @@ tapping an SSID opens an on-screen keyboard for the password and runs
 Service gates itself on /dev/fb1 existing (systemd ConditionPathExists), so
 installing the dashboard on a pi without an LCD is a no-op at runtime.
 """
-import os, sys, time, mmap, json, subprocess, threading, signal
+import os, sys, time, mmap, json, subprocess, threading, signal, secrets, re
+import http.server, urllib.parse, html as html_escape
 from collections import deque
 from PIL import Image, ImageDraw, ImageFont
 import evdev
 from evdev import ecodes
 import numpy as np
+import qrcode
 
 # ---- config -----------------------------------------------------------------
 
@@ -179,6 +181,209 @@ class Touch:
             out = self.queue[:]
             self.queue.clear()
         return out
+
+# ---- tailscale control server ----------------------------------------------
+#
+# A tiny HTTP server that lets a phone — after scanning the QR on the LCD —
+# disconnect from the current tailnet or re-authenticate to a new one. The
+# LCD view generates a fresh session token each time it's opened; the server
+# rejects requests that don't carry it, so even though the server binds on
+# every interface, only someone who's currently looking at the LCD can drive
+# it. The token is invalidated when the view closes.
+#
+# Bound on 0.0.0.0 so a phone on the pi's wifi uplink can reach it at the
+# pi's wlan0 IP. If you'd prefer LAN-only, set TAILPIPE_TS_BIND=<lan_ip>.
+
+TS_PORT = int(os.environ.get('TAILPIPE_TS_PORT', '8080'))
+TS_BIND = os.environ.get('TAILPIPE_TS_BIND', '0.0.0.0')
+
+# Shared between the LCD thread and the HTTP handler. Single-writer from the
+# LCD thread, occasional reads from handler threads — a threading.Lock keeps
+# it tidy.
+_srv_state = {
+    'token': None,            # str; None when the LCD view is closed
+    'token_at': 0.0,          # monotonic timestamp of last token issue
+    'auth_url': None,         # most recently captured tailscale login URL
+    'auth_proc': None,        # subprocess.Popen of current 'tailscale up'
+    'last_msg': '',           # transient note to show on the phone page
+}
+_srv_lock = threading.Lock()
+
+def srv_issue_token():
+    tok = secrets.token_urlsafe(10)
+    with _srv_lock:
+        _srv_state['token'] = tok
+        _srv_state['token_at'] = time.monotonic()
+        _srv_state['auth_url'] = None
+        _srv_state['last_msg'] = ''
+    return tok
+
+def srv_clear_token():
+    with _srv_lock:
+        _srv_state['token'] = None
+        _srv_state['auth_url'] = None
+        p = _srv_state.get('auth_proc')
+        _srv_state['auth_proc'] = None
+    if p and p.poll() is None:
+        try: p.terminate()
+        except Exception: pass
+
+def _token_valid(tok):
+    with _srv_lock:
+        saved = _srv_state['token']
+        age = time.monotonic() - _srv_state['token_at']
+    return saved and tok == saved and age < 600
+
+def _render_index():
+    rc, out, _ = run(['tailscale', 'status', '--json'], timeout=5)
+    connected = False; tnet = '-'; ts_ip = '-'
+    try:
+        d = json.loads(out or '{}')
+        self_node = d.get('Self') or {}
+        ts_ip = (self_node.get('TailscaleIPs') or ['-'])[0]
+        tnet = d.get('MagicDNSSuffix') or '-'
+        connected = d.get('BackendState') == 'Running'
+    except Exception:
+        pass
+    with _srv_lock:
+        tok = _srv_state['token'] or ''
+        msg = _srv_state['last_msg']
+    state_txt = '<b style="color:#3a3">connected</b>' if connected else '<b style="color:#a33">disconnected</b>'
+    msg_html = f'<p style="padding:8px;background:#eef;border-radius:6px">{html_escape.escape(msg)}</p>' if msg else ''
+    return f"""<!doctype html>
+<html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<title>TailPiPE — Tailscale</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:420px;margin:1em auto;padding:0 16px;color:#222}}
+h1{{font-size:1.3em;margin:.5em 0}}
+.card{{background:#f4f4f7;border-radius:10px;padding:14px;margin:14px 0}}
+button{{font-size:1.1em;padding:14px 18px;border-radius:10px;border:0;width:100%;margin:6px 0;cursor:pointer}}
+.danger{{background:#c43030;color:#fff}}
+.primary{{background:#2f71c9;color:#fff}}
+.muted{{color:#777;font-size:.9em}}
+</style></head>
+<body>
+<h1>TailPiPE — Tailscale</h1>
+<div class=card>
+<p>state: {state_txt}</p>
+<p>tailnet: <code>{html_escape.escape(tnet)}</code></p>
+<p>ip: <code>{html_escape.escape(ts_ip)}</code></p>
+</div>
+{msg_html}
+<form method=POST action="/reauth?t={tok}">
+<button class=primary>Connect to a different tailnet</button>
+</form>
+<form method=POST action="/disconnect?t={tok}" onsubmit="return confirm('Really disconnect this node from the tailnet?');">
+<button class=danger>Disconnect</button>
+</form>
+<p class=muted>Session expires when the LCD view is closed.</p>
+</body></html>"""
+
+def _start_reauth_capture():
+    """Run `tailscale logout && tailscale up`, wait up to 15s for the
+    auth URL on stdout, and return it. The tailscale-up process is left
+    running so the kernel can capture the user's phone-side login."""
+    # logout first (best-effort; may already be logged out)
+    subprocess.run(['tailscale', 'logout'], capture_output=True, timeout=30)
+    lan_subnet = os.environ.get('TAILPIPE_LAN_SUBNET', '192.168.50.0/24')
+    cmd = ['tailscale', 'up', '--reset', '--accept-dns=false',
+           f'--advertise-routes={lan_subnet}', '--hostname=' + os.uname().nodename]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, bufsize=1)
+    with _srv_lock:
+        _srv_state['auth_proc'] = p
+    deadline = time.monotonic() + 15
+    url = None
+    while time.monotonic() < deadline:
+        line = p.stdout.readline()
+        if not line:
+            if p.poll() is not None: break
+            continue
+        m = re.search(r'https://login\.tailscale\.com/a/\S+', line)
+        if m:
+            url = m.group(0); break
+    with _srv_lock:
+        _srv_state['auth_url'] = url
+    return url
+
+def _render_auth(url):
+    if not url:
+        return """<!doctype html><html><body style="font-family:sans-serif;padding:16px">
+<h2>No auth URL received</h2><p>Try again from the main page.</p>
+<p><a href="/?t={}">&larr; back</a></p></body></html>""".format(_srv_state.get('token') or '')
+    # QR for the phone to pass to another device, plus a direct link.
+    import io, base64
+    q = qrcode.QRCode(box_size=5, border=2)
+    q.add_data(url); q.make(fit=True)
+    im = q.make_image(fill_color='black', back_color='white').convert('RGB')
+    buf = io.BytesIO(); im.save(buf, format='PNG')
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"""<!doctype html>
+<html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<title>TailPiPE — finish auth</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:420px;margin:1em auto;padding:0 16px}}
+a.btn{{display:block;background:#2f71c9;color:#fff;padding:16px;border-radius:10px;text-align:center;text-decoration:none;font-size:1.1em;margin:12px 0}}
+img{{width:240px;height:auto;display:block;margin:12px auto;background:#fff;border-radius:8px;padding:6px}}
+.muted{{color:#777;font-size:.9em}}</style>
+</head>
+<body>
+<h1>Authorize this node</h1>
+<p>Open this link on whichever device owns the target tailnet account:</p>
+<a class=btn href="{html_escape.escape(url)}">{html_escape.escape(url)}</a>
+<p class=muted>Or scan this with another device:</p>
+<img alt="auth QR" src="data:image/png;base64,{b64}">
+<p class=muted>Once you've approved the node, it'll automatically join the new tailnet.</p>
+</body></html>"""
+
+class TSHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a, **kw): pass  # silence default stderr logging
+    def _tok(self):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        return q.get('t', [''])[0]
+    def _guard(self):
+        if not _token_valid(self._tok()):
+            self.send_error(403, 'session expired; re-open the LCD view')
+            return False
+        return True
+    def _send_html(self, body, code=200):
+        data = body.encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers(); self.wfile.write(data)
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path in ('/', '/index', '/index.html'):
+            if not self._guard(): return
+            self._send_html(_render_index())
+        else:
+            self.send_error(404)
+    def do_POST(self):
+        if not self._guard(): return
+        path = urllib.parse.urlparse(self.path).path
+        if path == '/disconnect':
+            subprocess.run(['tailscale', 'logout'], capture_output=True, timeout=30)
+            with _srv_lock: _srv_state['last_msg'] = 'disconnected'
+            self.send_response(303); self.send_header('Location', '/?t=' + self._tok()); self.end_headers()
+        elif path == '/reauth':
+            url = _start_reauth_capture()
+            self._send_html(_render_auth(url))
+        else:
+            self.send_error(404)
+
+def start_control_server():
+    try:
+        srv = http.server.ThreadingHTTPServer((TS_BIND, TS_PORT), TSHandler)
+    except OSError as e:
+        print(f'control server bind failed ({TS_BIND}:{TS_PORT}): {e}', file=sys.stderr)
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+def render_qr_image(text, box_size=4, border=2, fill='black', back='white'):
+    q = qrcode.QRCode(box_size=box_size, border=border)
+    q.add_data(text); q.make(fit=True)
+    return q.make_image(fill_color=fill, back_color=back).convert('RGB')
 
 # ---- touch calibration ------------------------------------------------------
 
@@ -477,11 +682,61 @@ def draw_status(d, state):
 # ---- touch handlers ---------------------------------------------------------
 
 def handle_main_tap(state, x, y):
+    # Top-left of the header (hostname + lan/tailnet IP text) opens the
+    # tailscale control view — QR code that pairs a phone with the pi's
+    # built-in control server.
+    if y < 34 and x < 290:
+        state['view'] = 'tailscale'
+        tok = srv_issue_token()
+        wan_ip = ip4(WAN_IFACE)
+        lan_ip = ip4(LAN_IFACE)
+        host_ip = wan_ip if wan_ip != '-' else lan_ip
+        state['ts_url'] = f'http://{host_ip}:{TS_PORT}/?t={tok}'
+        state['ts_qr'] = render_qr_image(state['ts_url'], box_size=4)
+        return
     # Whole top-right region (SSID text + signal% + bars + icon) opens the
     # wifi picker — not just the 4-bar icon.
     if y < 34 and x > 290:
         state['view'] = 'wifi'; state['scanning'] = True
         threading.Thread(target=_do_scan, args=(state,), daemon=True).start()
+
+def draw_tailscale(d, state, img):
+    d.rectangle([0, 0, W, H], fill=BG)
+    d.rectangle([0, 0, W, 34], fill=PANEL)
+    d.text((8, 8), 'TAILSCALE CONTROL', font=F_MD, fill=FG)
+    d.rectangle([436, 4, 474, 28], fill=(80, 30, 30))
+    d.text((449, 6), 'X', font=F_MD, fill=FG)
+    qr = state.get('ts_qr')
+    if qr is not None:
+        qx = 20; qy = 50
+        img.paste(qr, (qx, qy))
+        qh = qr.size[1]
+        d.text((qx, qy + qh + 6), 'scan with phone on this wifi', font=F_SM, fill=DIM)
+    # right column: current status + URL
+    rc, out, _ = run(['tailscale', 'status', '--json'], timeout=2)
+    tnet = '-'; ts_ip = '-'; state_txt = 'unknown'
+    try:
+        j = json.loads(out or '{}')
+        tnet = j.get('MagicDNSSuffix') or '-'
+        ts_ip = (j.get('Self', {}).get('TailscaleIPs') or ['-'])[0]
+        state_txt = j.get('BackendState', '?')
+    except Exception: pass
+    cx = 230; cy = 50
+    d.text((cx, cy),      f'state:   {state_txt}', font=F_MD, fill=FG); cy += 22
+    d.text((cx, cy),      f'tailnet: {tnet}',     font=F_SM, fill=DIM); cy += 16
+    d.text((cx, cy),      f'ip:      {ts_ip}',    font=F_SM, fill=DIM); cy += 22
+    d.text((cx, cy),      'URL:', font=F_SM, fill=FG); cy += 14
+    url = state.get('ts_url', '')
+    for chunk_start in range(0, len(url), 30):
+        d.text((cx, cy), url[chunk_start:chunk_start+30], font=F_SM, fill=DIM); cy += 12
+    d.text((8, H - 14), 'tap anywhere (or X) to close', font=F_SM, fill=DIM)
+
+def handle_tailscale_tap(state, x, y):
+    # Close on any tap — the primary interaction is on the phone once the
+    # QR is scanned. Keeping the LCD dismiss obvious avoids trapping users.
+    srv_clear_token()
+    state.pop('ts_url', None); state.pop('ts_qr', None)
+    state['view'] = 'main'
 
 CAL_MAX_ERR_PX = 35  # reject calibration if any target residual exceeds this
 
@@ -615,6 +870,7 @@ def main():
     if not FB_DEV or not os.path.exists(FB_DEV):
         print('no LCD framebuffer detected; exiting.', file=sys.stderr); sys.exit(0)
     fb = FB(FB_DEV)
+    start_control_server()
     touch_dev = find_touch()
     touch = Touch(touch_dev, W, H, matrix=load_calibration()) if touch_dev else None
     wlan = Rate(WAN_IFACE); eth = Rate(LAN_IFACE); ts = Rate(TS_IFACE)
@@ -665,6 +921,8 @@ def main():
                     handle_kbd_tap(state, sx, sy)
                 elif state['view'] == 'calibrate':
                     handle_calibration_tap(state, sx, sy, rx, ry)
+                elif state['view'] == 'tailscale':
+                    handle_tailscale_tap(state, sx, sy)
         d = ImageDraw.Draw(img)
         d.rectangle([0, 0, W, H], fill=BG)
         if state['view'] == 'main':
@@ -675,6 +933,8 @@ def main():
             draw_kbd(d, state)
         elif state['view'] == 'calibrate':
             draw_calibration(d, state)
+        elif state['view'] == 'tailscale':
+            draw_tailscale(d, state, img)
         draw_status(d, state)
         fb.push(img)
         time.sleep(0.2)  # ~5 FPS

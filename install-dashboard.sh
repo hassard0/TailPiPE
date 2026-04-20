@@ -47,7 +47,8 @@ log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 log "Installing dashboard dependencies"
 apt-get update -q
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
-  python3 python3-pil python3-evdev python3-numpy fonts-dejavu-core
+  python3 python3-pil python3-evdev python3-numpy python3-qrcode \
+  fonts-dejavu-core
 
 log "Installing dashboard script + systemd unit"
 # We avoid 'install' here: on some Pi OS images it has produced 0-byte
