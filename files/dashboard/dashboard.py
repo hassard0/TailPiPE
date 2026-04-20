@@ -476,14 +476,7 @@ def draw_status(d, state):
 
 # ---- touch handlers ---------------------------------------------------------
 
-def handle_main_tap(state, x, y, is_long):
-    # Long-press in the middle third -> touch calibration wizard.
-    if is_long and (W//3) < x < (2*W//3) and (H//3) < y < (2*H//3):
-        state['view'] = 'calibrate'
-        state['cal_idx'] = 0
-        state['cal_raw_pts'] = []
-        set_status(state, 'calibration started — tap each crosshair', 4)
-        return
+def handle_main_tap(state, x, y):
     # Whole top-right region (SSID text + signal% + bars + icon) opens the
     # wifi picker — not just the 4-bar icon.
     if y < 34 and x > 290:
@@ -503,16 +496,10 @@ def draw_calibration(d, state):
     d.text((W//2 - 90, H//2 - 20), 'TOUCH CALIBRATION', font=F_LG, fill=FG)
     d.text((W//2 - 70, H//2 + 6), f'tap target {idx + 1} of {len(CAL_TARGETS)}',
            font=F_MD, fill=DIM)
-    d.text((W//2 - 140, H - 18), 'long-press center again to cancel',
+    d.text((W//2 - 150, H - 18), '5 rapid taps any time to restart',
            font=F_SM, fill=DIM)
 
-def handle_calibration_tap(state, sx, sy, rx, ry, is_long):
-    # Abort: long-press anywhere reverts without saving.
-    if is_long:
-        state['view'] = 'main'
-        state.pop('cal_raw_pts', None); state.pop('cal_idx', None)
-        set_status(state, 'calibration cancelled', 2)
-        return
+def handle_calibration_tap(state, sx, sy, rx, ry):
     pts = state.setdefault('cal_raw_pts', [])
     pts.append((rx, ry))
     state['cal_idx'] = state.get('cal_idx', 0) + 1
@@ -618,15 +605,31 @@ def main():
             last_slow = now
         if touch:
             for kind, sx, sy, rx, ry in touch.poll():
-                is_long = (kind == 'long_tap')
+                # Secret gesture: 5 taps within 2.5 s opens the calibration
+                # wizard. Works from any view, so it's recoverable even when
+                # touch mapping is badly wrong. Resets the running window on
+                # entry so you don't accidentally re-trigger.
+                tnow = time.monotonic()
+                recent = state.setdefault('recent_taps', [])
+                recent.append(tnow)
+                cutoff = tnow - 2.5
+                while recent and recent[0] < cutoff:
+                    recent.pop(0)
+                if len(recent) >= 5:
+                    state['recent_taps'] = []
+                    state['view'] = 'calibrate'
+                    state['cal_idx'] = 0
+                    state['cal_raw_pts'] = []
+                    set_status(state, 'calibration — tap each crosshair', 4)
+                    continue
                 if state['view'] == 'main':
-                    handle_main_tap(state, sx, sy, is_long)
+                    handle_main_tap(state, sx, sy)
                 elif state['view'] == 'wifi':
                     handle_wifi_tap(state, sx, sy)
                 elif state['view'] == 'kbd':
                     handle_kbd_tap(state, sx, sy)
                 elif state['view'] == 'calibrate':
-                    handle_calibration_tap(state, sx, sy, rx, ry, is_long)
+                    handle_calibration_tap(state, sx, sy, rx, ry)
         d = ImageDraw.Draw(img)
         d.rectangle([0, 0, W, H], fill=BG)
         if state['view'] == 'main':

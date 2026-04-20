@@ -179,12 +179,13 @@ comes from `python-evdev`. About 20 MB of RAM at idle.
 ### Touch calibration
 
 If taps land in the wrong place (common — axes and offsets vary by panel
-batch), **press and hold the middle third of the screen for ~1.5 s** to
-enter calibration. A crosshair walks through 5 points (4 corners + center);
-tap each. The resulting 2×3 affine matrix is saved to
-`/etc/tailpipe/touch-cal.json` and loaded on startup. A long-press during
-calibration cancels without saving. If no calibration file is present, the
-dashboard falls back to a named rotation (default 270°, override with
+batch), **tap the screen 5 times in rapid succession** (within 2.5 s,
+anywhere) to open calibration. A crosshair walks through 5 points (4
+corners + center); tap each center. The resulting 2×3 affine matrix is
+saved to `/etc/tailpipe/touch-cal.json` and loaded on startup. The gesture
+works from any view, so it's recoverable even when the current mapping is
+completely wrong. If no calibration file is present, the dashboard falls
+back to a named rotation (default 270°, override with
 `TAILPIPE_TOUCH_ROTATE=0|90|180|270`).
 
 ## Uninstall
