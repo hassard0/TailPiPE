@@ -536,43 +536,44 @@ def read_client_flows(lan_prefix):
     """Group active conntrack flows by originating LAN client.
 
     Returns {client_ip: {'flows': int, 'protos': set, 'dests': Counter}},
-    where dests counts unique destination IPs. nf_conntrack lists both the
-    "original" tuple (client -> peer) and the "reply" tuple (peer -> pi's
-    uplink IP after SNAT); parsing only the first src=/dst= per line gives
-    us the original direction, which is what we want to attribute to a
-    client."""
+    where dests counts unique destination IPs. Uses the `conntrack` CLI
+    (netlink) rather than /proc/net/nf_conntrack — the latter isn't built
+    into Pi OS Trixie's kernel (CONFIG_NF_CONNTRACK_PROCFS is off). Lines
+    carry both the 'original' tuple (client -> peer) and the 'reply' tuple
+    (peer -> pi's uplink IP); we parse only the first src=/dst= pair, which
+    is the original direction — the one worth attributing to a LAN client."""
     from collections import Counter
     groups = {}
+    subnet = lan_prefix.rstrip('.') + '.0/24'
     try:
-        with open('/proc/net/nf_conntrack') as f:
-            for line in f:
-                # skip ipv6 for now; field 0 is family, field 2 is proto
-                parts = line.split()
-                if not parts or parts[0] != 'ipv4':
-                    continue
-                proto = parts[2] if len(parts) > 2 else ''
-                src = dst = None
-                for tok in parts:
-                    if src is None and tok.startswith('src='):
-                        src = tok[4:]
-                    elif dst is None and tok.startswith('dst='):
-                        dst = tok[4:]
-                    if src and dst:
-                        break
-                if not src or not dst:
-                    continue
-                if not src.startswith(lan_prefix):
-                    continue
-                # ignore chatter to the gateway/broadcast itself
-                if dst.endswith('.255'):
-                    continue
-                g = groups.setdefault(src, {'flows': 0, 'protos': set(),
-                                            'dests': Counter()})
-                g['flows'] += 1
-                g['protos'].add(proto)
-                g['dests'][dst] += 1
-    except OSError:
-        pass
+        r = subprocess.run(['conntrack', '-L', '-s', subnet],
+                            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        return groups
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        proto = parts[0]
+        src = dst = None
+        for tok in parts:
+            if src is None and tok.startswith('src='):
+                src = tok[4:]
+            elif dst is None and tok.startswith('dst='):
+                dst = tok[4:]
+            if src and dst:
+                break
+        if not src or not dst:
+            continue
+        if not src.startswith(lan_prefix):
+            continue
+        if dst.endswith('.255'):
+            continue
+        g = groups.setdefault(src, {'flows': 0, 'protos': set(),
+                                    'dests': Counter()})
+        g['flows'] += 1
+        g['protos'].add(proto)
+        g['dests'][dst] += 1
     return groups
 
 # ---- rendering --------------------------------------------------------------

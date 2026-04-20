@@ -48,7 +48,7 @@ log "Installing dashboard dependencies"
 apt-get update -q
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
   python3 python3-pil python3-evdev python3-numpy python3-qrcode \
-  fonts-dejavu-core
+  fonts-dejavu-core conntrack
 
 log "Installing dashboard script + systemd unit"
 # We avoid 'install' here: on some Pi OS images it has produced 0-byte
