@@ -9,11 +9,12 @@ tapping an SSID opens an on-screen keyboard for the password and runs
 Service gates itself on /dev/fb1 existing (systemd ConditionPathExists), so
 installing the dashboard on a pi without an LCD is a no-op at runtime.
 """
-import os, sys, time, mmap, struct, subprocess, threading, signal
+import os, sys, time, mmap, json, subprocess, threading, signal
 from collections import deque
 from PIL import Image, ImageDraw, ImageFont
 import evdev
 from evdev import ecodes
+import numpy as np
 
 # ---- config -----------------------------------------------------------------
 
@@ -110,13 +111,13 @@ class Touch:
     480x320 landscape origin matches finger presses on a screen configured
     with `dtoverlay=waveshare35a,rotate=90`.
     """
-    def __init__(self, dev, screen_w, screen_h, rotate=None):
+    def __init__(self, dev, screen_w, screen_h, matrix=None, rotate=None):
         self.dev = dev
         self.w = screen_w; self.h = screen_h
-        # Default: rotate=270. The piscreen overlay sets touchscreen-swapped-x-y
-        # in device tree; combined with the display's rotate=90, the touch
-        # axes come out rotated 270 relative to the rendered frame. Override
-        # with TAILPIPE_TOUCH_ROTATE=0|90|180|270 if your panel differs.
+        # Prefer a saved affine calibration (matrix). If absent, fall back to
+        # a named rotation: piscreen + display rotate=90 nets to touch
+        # rotate=270. Override with TAILPIPE_TOUCH_ROTATE=0|90|180|270.
+        self.matrix = matrix  # 2x3 numpy array mapping [rx, ry, 1] -> [sx, sy]
         if rotate is None:
             try:
                 rotate = int(os.environ.get('TAILPIPE_TOUCH_ROTATE', '270'))
@@ -128,22 +129,33 @@ class Touch:
         self.ymin, self.ymax = ax[ecodes.ABS_Y].min, ax[ecodes.ABS_Y].max
         self._x = self._y = 0
         self._down = False
-        self.queue = []  # list of (x,y) taps
+        self._down_t = 0.0
+        # Queue entries: (kind, screen_x, screen_y, raw_x, raw_y) where
+        # kind is 'tap' or 'long_tap'. Raw coords are preserved so the
+        # calibration routine can learn the mapping directly from them.
+        self.queue = []
         self._lock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
+
+    def set_matrix(self, M):
+        self.matrix = M
     def _map(self, raw_x, raw_y):
-        # Touch panel natural orientation is portrait (320x480). After rotate=90
-        # in the overlay, the screen is landscape 480x320.
-        fx = (raw_x - self.xmin) / max(1, self.xmax - self.xmin)
-        fy = (raw_y - self.ymin) / max(1, self.ymax - self.ymin)
-        if self.rotate == 90:
-            x = int(fy * self.w)
-            y = int((1 - fx) * self.h)
-        elif self.rotate == 270:
-            x = int((1 - fy) * self.w)
-            y = int(fx * self.h)
+        if self.matrix is not None:
+            v = self.matrix @ np.array([raw_x, raw_y, 1.0])
+            x, y = int(v[0]), int(v[1])
         else:
-            x = int(fx * self.w); y = int(fy * self.h)
+            # Portrait-native panel; named rotation compensates for the
+            # overlay + touchscreen-swapped-x-y combination.
+            fx = (raw_x - self.xmin) / max(1, self.xmax - self.xmin)
+            fy = (raw_y - self.ymin) / max(1, self.ymax - self.ymin)
+            if self.rotate == 90:
+                x, y = int(fy * self.w), int((1 - fx) * self.h)
+            elif self.rotate == 270:
+                x, y = int((1 - fy) * self.w), int(fx * self.h)
+            elif self.rotate == 180:
+                x, y = int((1 - fx) * self.w), int((1 - fy) * self.h)
+            else:
+                x, y = int(fx * self.w), int(fy * self.h)
         return max(0, min(self.w - 1, x)), max(0, min(self.h - 1, y))
     def _loop(self):
         for ev in self.dev.read_loop():
@@ -151,17 +163,53 @@ class Touch:
                 if ev.code == ecodes.ABS_X: self._x = ev.value
                 elif ev.code == ecodes.ABS_Y: self._y = ev.value
             elif ev.type == ecodes.EV_KEY and ev.code == ecodes.BTN_TOUCH:
-                was = self._down
-                self._down = bool(ev.value)
-                if was and not self._down:
-                    x, y = self._map(self._x, self._y)
-                    with self._lock:
-                        self.queue.append((x, y))
+                if ev.value:
+                    self._down = True
+                    self._down_t = time.monotonic()
+                else:
+                    if self._down:
+                        rx, ry = self._x, self._y
+                        sx, sy = self._map(rx, ry)
+                        kind = 'long_tap' if (time.monotonic() - self._down_t) > 1.2 else 'tap'
+                        with self._lock:
+                            self.queue.append((kind, sx, sy, rx, ry))
+                    self._down = False
     def poll(self):
         with self._lock:
             out = self.queue[:]
             self.queue.clear()
         return out
+
+# ---- touch calibration ------------------------------------------------------
+
+CALIB_PATH = '/etc/tailpipe/touch-cal.json'
+# Target screen points for the 5-dot affine calibration, in screen coords.
+# Order: top-left, top-right, bottom-right, bottom-left, center.
+CAL_TARGETS = [(40, 30), (440, 30), (440, 290), (40, 290), (240, 160)]
+
+def load_calibration():
+    try:
+        with open(CALIB_PATH) as f:
+            d = json.load(f)
+        M = np.array(d['matrix'], dtype=float)
+        if M.shape == (2, 3):
+            return M
+    except (OSError, ValueError, KeyError):
+        pass
+    return None
+
+def save_calibration(M):
+    os.makedirs(os.path.dirname(CALIB_PATH), exist_ok=True)
+    with open(CALIB_PATH, 'w') as f:
+        json.dump({'matrix': M.tolist(), 'targets': CAL_TARGETS}, f)
+
+def compute_affine(screen_pts, raw_pts):
+    """Least-squares fit of 2x3 affine: screen = M @ [rx, ry, 1]."""
+    S = np.asarray(screen_pts, dtype=float)   # (N, 2)
+    R = np.asarray(raw_pts, dtype=float)      # (N, 2)
+    A = np.column_stack([R, np.ones(len(R))])  # (N, 3)
+    Mt, *_ = np.linalg.lstsq(A, S, rcond=None)
+    return Mt.T   # (2, 3)
 
 # ---- system probes ----------------------------------------------------------
 
@@ -428,12 +476,56 @@ def draw_status(d, state):
 
 # ---- touch handlers ---------------------------------------------------------
 
-def handle_main_tap(state, x, y):
+def handle_main_tap(state, x, y, is_long):
+    # Long-press in the middle third -> touch calibration wizard.
+    if is_long and (W//3) < x < (2*W//3) and (H//3) < y < (2*H//3):
+        state['view'] = 'calibrate'
+        state['cal_idx'] = 0
+        state['cal_raw_pts'] = []
+        set_status(state, 'calibration started — tap each crosshair', 4)
+        return
     # Whole top-right region (SSID text + signal% + bars + icon) opens the
     # wifi picker — not just the 4-bar icon.
     if y < 34 and x > 290:
         state['view'] = 'wifi'; state['scanning'] = True
         threading.Thread(target=_do_scan, args=(state,), daemon=True).start()
+
+def draw_calibration(d, state):
+    d.rectangle([0, 0, W, H], fill=BG)
+    idx = state.get('cal_idx', 0)
+    if idx >= len(CAL_TARGETS):
+        return
+    tx, ty = CAL_TARGETS[idx]
+    d.ellipse([tx-14, ty-14, tx+14, ty+14], outline=ACCENT, width=2)
+    d.line([tx-20, ty, tx+20, ty], fill=ACCENT, width=1)
+    d.line([tx, ty-20, tx, ty+20], fill=ACCENT, width=1)
+    d.ellipse([tx-2, ty-2, tx+2, ty+2], fill=ACCENT)
+    d.text((W//2 - 90, H//2 - 20), 'TOUCH CALIBRATION', font=F_LG, fill=FG)
+    d.text((W//2 - 70, H//2 + 6), f'tap target {idx + 1} of {len(CAL_TARGETS)}',
+           font=F_MD, fill=DIM)
+    d.text((W//2 - 140, H - 18), 'long-press center again to cancel',
+           font=F_SM, fill=DIM)
+
+def handle_calibration_tap(state, sx, sy, rx, ry, is_long):
+    # Abort: long-press anywhere reverts without saving.
+    if is_long:
+        state['view'] = 'main'
+        state.pop('cal_raw_pts', None); state.pop('cal_idx', None)
+        set_status(state, 'calibration cancelled', 2)
+        return
+    pts = state.setdefault('cal_raw_pts', [])
+    pts.append((rx, ry))
+    state['cal_idx'] = state.get('cal_idx', 0) + 1
+    if state['cal_idx'] >= len(CAL_TARGETS):
+        try:
+            M = compute_affine(CAL_TARGETS, pts)
+            save_calibration(M)
+            state['touch'].set_matrix(M)
+            set_status(state, 'calibration saved', 4)
+        except Exception as e:
+            set_status(state, f'calibration failed: {e}'[:50], 5)
+        state['view'] = 'main'
+        state.pop('cal_raw_pts', None); state.pop('cal_idx', None)
 
 def handle_wifi_tap(state, x, y):
     if x >= 436 and y < 32:
@@ -502,14 +594,14 @@ def main():
         print('no LCD framebuffer detected; exiting.', file=sys.stderr); sys.exit(0)
     fb = FB(FB_DEV)
     touch_dev = find_touch()
-    touch = Touch(touch_dev, W, H) if touch_dev else None
+    touch = Touch(touch_dev, W, H, matrix=load_calibration()) if touch_dev else None
     wlan = Rate(WAN_IFACE); eth = Rate(LAN_IFACE); ts = Rate(TS_IFACE)
     state = {
         'view': 'main', 'lan_ip': '-', 'ts_ip': '-', 'wifi': (None, 0),
         'leases': [], 'wlan_rate': wlan, 'eth_rate': eth, 'ts_rate': ts,
         'wifi_list': [], 'scanning': False, 'selected_ssid': None,
         'password_buf': '', 'password_mask': True, 'shift': False,
-        'status': '', 'status_until': 0,
+        'status': '', 'status_until': 0, 'touch': touch,
     }
     stop = {'flag': False}
     def _term(*_): stop['flag'] = True
@@ -525,10 +617,16 @@ def main():
             state['wifi'] = wifi_status(); state['leases'] = read_leases()
             last_slow = now
         if touch:
-            for x, y in touch.poll():
-                if state['view'] == 'main': handle_main_tap(state, x, y)
-                elif state['view'] == 'wifi': handle_wifi_tap(state, x, y)
-                elif state['view'] == 'kbd': handle_kbd_tap(state, x, y)
+            for kind, sx, sy, rx, ry in touch.poll():
+                is_long = (kind == 'long_tap')
+                if state['view'] == 'main':
+                    handle_main_tap(state, sx, sy, is_long)
+                elif state['view'] == 'wifi':
+                    handle_wifi_tap(state, sx, sy)
+                elif state['view'] == 'kbd':
+                    handle_kbd_tap(state, sx, sy)
+                elif state['view'] == 'calibrate':
+                    handle_calibration_tap(state, sx, sy, rx, ry, is_long)
         d = ImageDraw.Draw(img)
         d.rectangle([0, 0, W, H], fill=BG)
         if state['view'] == 'main':
@@ -537,6 +635,8 @@ def main():
             draw_wifi_modal(d, state)
         elif state['view'] == 'kbd':
             draw_kbd(d, state)
+        elif state['view'] == 'calibrate':
+            draw_calibration(d, state)
         draw_status(d, state)
         fb.push(img)
         time.sleep(0.2)  # ~5 FPS
