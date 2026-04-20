@@ -2,11 +2,22 @@
 # TailPiPE uninstaller — reverses what install.sh did.
 # Does NOT uninstall Tailscale itself (you may want to keep it); use
 # `apt-get purge tailscale` separately if desired.
+#
+# Pass --dashboard to also tear down the optional LCD dashboard.
 set -euo pipefail
 
 LAN_IFACE="${LAN_IFACE:-eth0}"
 WAN_IFACE="${WAN_IFACE:-wlan0}"
 LAN_SUBNET="${LAN_SUBNET:-192.168.50.0/24}"
+
+REMOVE_DASHBOARD=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dashboard) REMOVE_DASHBOARD=1; shift ;;
+    -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
 
 [[ $EUID -eq 0 ]] || { echo "run as root"; exit 1; }
 
@@ -36,6 +47,22 @@ LAN_CON="$(nmcli -t -f NAME,DEVICE con show | awk -F: -v d="$LAN_IFACE" '$2==d{p
 if [[ -n "$LAN_CON" ]]; then
   nmcli con modify "$LAN_CON" ipv4.method auto ipv4.addresses "" ipv4.gateway "" ipv4.never-default no ipv6.method auto
   nmcli con up "$LAN_CON" 2>/dev/null || true
+fi
+
+if [[ $REMOVE_DASHBOARD -eq 1 ]]; then
+  echo "==> removing LCD dashboard"
+  systemctl disable --now tailpipe-dashboard.service 2>/dev/null || true
+  rm -f /etc/systemd/system/tailpipe-dashboard.service
+  rm -f /usr/local/bin/tailpipe-dashboard
+  rm -rf /etc/tailpipe
+  systemctl daemon-reload
+  # Leave the dtoverlay line in config.txt alone — editing the boot
+  # config during uninstall is too easy to get wrong. Note it for the
+  # user and let them remove manually if they want the SPI bus back.
+  if grep -qE '^dtoverlay=(piscreen|waveshare35|tinylcd35)' /boot/firmware/config.txt 2>/dev/null \
+     || grep -qE '^dtoverlay=(piscreen|waveshare35|tinylcd35)' /boot/config.txt 2>/dev/null; then
+    echo "   note: LCD dtoverlay line kept in config.txt — remove manually + reboot if desired."
+  fi
 fi
 
 echo "done. (Tailscale package kept; run 'apt-get purge tailscale' to remove it too.)"

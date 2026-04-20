@@ -5,12 +5,18 @@ Turn a Raspberry Pi into a **tailnet-bridged LAN gateway**: plug any device
 Pi's ethernet port and it gets DHCP, internet, **and** full reachability to
 your Tailscale tailnet — including resolving tailnet hostnames by short name.
 
+Optional extra: attach a 3.5" SPI touchscreen for a live dashboard with wifi
+picker, bandwidth graphs, connected-client list, and a QR-code-driven phone
+UI to re-auth Tailscale.
+
 ```
     +---------------------+                +--------------------+
     |   eth client        |  ethernet      |  Raspberry Pi      |  wifi
     |   DHCP 192.168.50.x | <------------> |  dnsmasq + NAT     | <-------> internet
     |   gw/DNS=pi         |                |  tailscale (wlan0) | <-------> tailnet (100.x.x.x)
     +---------------------+                +--------------------+
+                                                    |
+                                      (optional) 3.5" LCD / touch
 ```
 
 ## What it does
@@ -38,7 +44,7 @@ your Tailscale tailnet — including resolving tailnet hostnames by short name.
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/TailPiPE.git
+git clone https://github.com/hassard0/TailPiPE.git
 cd TailPiPE
 sudo ./install.sh
 ```
@@ -59,7 +65,7 @@ The installer will:
    refreshes `/etc/hosts.tailscale` from `tailscale status` every 5 min,
    SIGHUP'ing dnsmasq on change.
 
-### Customizing
+### Customising
 
 Set env vars before running the installer to change defaults:
 
@@ -87,7 +93,7 @@ sudo LAN_SUBNET=10.42.0.0/24 LAN_IP=10.42.0.1 \
 
 Tailscale's subnet-router feature normally requires the subnet to be
 **approved** in the admin console before peers have a route back to it. If
-you skip that step (or can't use it — e.g. a tailnet you don't admin), traffic
+you skip that step (or can't — e.g. a tailnet you don't admin), traffic
 from eth clients reaches tailnet peers but replies have nowhere to go.
 
 TailPiPE adds an `iptables -t nat ... -o tailscale0 -j MASQUERADE` rule, so
@@ -140,80 +146,147 @@ sudo networkctl renew <iface>
 sudo nmcli connection down "<conn>" && sudo nmcli connection up "<conn>"
 ```
 
-## Optional: on-device LCD dashboard
+---
 
-If you've attached a Waveshare-compatible 3.5" SPI touchscreen (ILI9486 +
-XPT2046 — e.g. the Waveshare 3.5", GeekPi 3.5", or any clone of either), you
-can install a small dashboard that shows:
+## Optional: 3.5" LCD dashboard
 
-- Hostname, LAN IP, tailnet IP
-- Live RX/TX bandwidth for `wlan0`, `eth0`, and `tailscale0`, with 60-second
-  spark lines
-- Current DHCP leases (IP / name / MAC) — same list dnsmasq hands out
-- A wifi icon in the top-right corner with signal strength; tap it to scan
-  networks and tap an SSID to connect (on-screen keyboard for the password)
+If you've attached a Waveshare-compatible 3.5" SPI touchscreen
+(ILI9486 + XPT2046 — e.g. Waveshare 3.5", GeekPi 3.5", or any clone) you can
+install a local touch UI. It renders directly to the LCD framebuffer through
+Pillow (no X11, no SDL) and reads touch via `python-evdev`. ~20 MB of RAM.
+
+### What the screen shows
+
+- **Header**: hostname, LAN IP, tailnet IP, current wifi SSID + signal bars.
+- **Bandwidth**: live RX/TX for `wlan0`, `eth0`, and `tailscale0` with
+  60-second spark lines.
+- **Connected clients**: current dnsmasq DHCP leases (IP / name / MAC).
+- **Tap top-left of the header** → QR-code-driven phone UI for Tailscale
+  disconnect / re-auth (details below).
+- **Tap top-right of the header** → wifi picker with on-screen keyboard.
+- **Tap 5× in rapid succession** anywhere → touch-calibration wizard.
+
+### Install
 
 ```bash
-# If the LCD overlay is not yet enabled (no /dev/fb1):
+# First time, LCD overlay not yet enabled (no /dev/fb* named 'fb_ili9486'):
 sudo ./install-dashboard.sh --with-driver
 sudo reboot
 
-# If the LCD driver is already set up:
+# Or if the driver is already loaded:
 sudo ./install-dashboard.sh
 ```
 
+Flags for `install-dashboard.sh`:
+
+| Flag              | Default                     | Meaning                                           |
+|-------------------|-----------------------------|---------------------------------------------------|
+| `--with-driver`   | (off)                       | Append `dtoverlay=...` + `dtparam=spi=on` to `config.txt`. Reboot required. |
+| `--overlay NAME`  | `piscreen`                  | Which device-tree overlay to use.                 |
+| `--rotate N`      | `90`                        | Display rotation (0 / 90 / 180 / 270).            |
+
+`piscreen` is the modern Pi OS name for the ILI9486+XPT2046 combo — the
+legacy `waveshare35[abcg]` overlays were removed from Raspberry Pi's
+`overlays/` directory in Pi OS Trixie. The extra params `speed=24000000`,
+`fps=30`, and **`xohms=60`** are baked in: without the right `xohms` the
+ads7846 driver reads pressure as zero and filters every tap as invalid.
+
 If no LCD framebuffer is present at startup, the dashboard script exits
-cleanly with status 0 and systemd does not retry. After physically attaching
-the LCD (and adding the overlay), `systemctl restart tailpipe-dashboard`
-brings it up without touching anything else.
+cleanly (status 0) and systemd does not retry. After physically attaching
+the LCD (and adding the overlay) `systemctl restart tailpipe-dashboard`
+brings it up — no reconfiguration needed.
 
-The framebuffer device is auto-detected by scanning `/sys/class/graphics/fbN/name`
-for the `fb_ili9486` / `fbtft` driver, so the same build works whether the
-LCD lands on `fb0` (Pi OS Trixie with KMS-only HDMI) or `fb1` (older images
-with a legacy HDMI fbdev). Override by setting `TAILPIPE_FB=/dev/fbN` in the
-service unit if needed.
+The framebuffer device is auto-detected by scanning
+`/sys/class/graphics/fbN/name` for the `fb_ili9486` / `fbtft` driver, so
+the same build works whether the LCD lands on `fb0` (Pi OS Trixie with
+KMS-only HDMI) or `fb1` (older images with a legacy HDMI fbdev). Override
+with `TAILPIPE_FB=/dev/fbN` in the service unit if needed.
 
-Rendering goes directly to `/dev/fb1` via Pillow (no X11, no SDL) and touch
-comes from `python-evdev`. About 20 MB of RAM at idle.
+### Wifi picker
+
+Tap the **top-right region of the header** (SSID text + signal% + bar
+icon — all tappable, not just the icon pixels). The dashboard scans with
+`nmcli dev wifi rescan`, presents a list sorted by signal strength, and
+marks networks that require a password with `[P]`. Tap a network:
+
+- **Open networks** connect immediately.
+- **WPA networks** bring up a QWERTY on-screen keyboard with SHIFT, space,
+  backspace, OK and CANCEL. The password is piped to `nmcli dev wifi
+  connect <ssid> password <pw>`; status flashes on the bottom bar.
 
 ### Tailscale control (QR + phone)
 
-Tapping the **top-left of the header** (hostname / LAN IP / tailnet IP area)
-opens a QR-code view. Scan it with a phone on the pi's wifi uplink and
-you'll land on a small HTML page served by the dashboard that lets you:
+Tap the **top-left region of the header** (hostname / lan / tailnet IP
+text). The view shows a QR code pointing at a URL like
+`http://<wifi_ip>:8080/?t=<session-token>` plus the current tailscale
+state. Scan with a phone on the same wifi uplink and you'll see a small
+HTML page with two actions:
 
-- Disconnect this node from the current tailnet
-- Re-authenticate to a different tailnet (the page will then show a
-  clickable login URL and an auxiliary QR code for the tailscale auth flow,
-  so you can sign in on whichever device owns the new account)
+- **Disconnect** — runs `tailscale logout`.
+- **Connect to a different tailnet** — runs `tailscale logout &&
+  tailscale up --reset`, captures the login URL from stdout within 15 s,
+  and displays it on the phone as a clickable link *and* an auxiliary QR,
+  so you can complete sign-in on whichever device owns the target tailnet
+  account.
 
-The page is gated by a single-use session token embedded in the QR URL —
-generated when the view opens and invalidated when it closes, so neighbours
-on the same wifi can't hit the endpoint without seeing the LCD. The server
-listens on port 8080 of every interface by default; set
-`TAILPIPE_TS_BIND=<lan_ip>` (and `TAILPIPE_TS_PORT=<n>`) in the service
-unit to restrict it.
+The page is gated by a session token minted when the LCD view opens and
+invalidated when it closes. Anyone without current sight of the LCD can't
+drive the endpoint even if they share your wifi. Server binds `0.0.0.0:8080`
+by default; override with `TAILPIPE_TS_BIND=<ip>` and/or
+`TAILPIPE_TS_PORT=<n>` in the service unit.
+
+Tap anywhere on the LCD (or the `X` in the corner) to close the view and
+expire the token.
 
 ### Touch calibration
 
 If taps land in the wrong place (common — axes and offsets vary by panel
 batch), **tap the screen 5 times in rapid succession** (within 2.5 s,
-anywhere) to open calibration. A crosshair walks through 5 points (4
-corners + center); tap each center. The resulting 2×3 affine matrix is
-saved to `/etc/tailpipe/touch-cal.json` and loaded on startup. The gesture
-works from any view, so it's recoverable even when the current mapping is
-completely wrong. If no calibration file is present, the dashboard falls
-back to a named rotation (default 270°, override with
-`TAILPIPE_TOUCH_ROTATE=0|90|180|270`).
+anywhere) to open the calibration wizard. You'll see a START button on
+the LCD:
+
+1. Tap anywhere to begin. (The button is a visual hint — its hitbox is the
+   whole screen so the wizard still opens even when current mapping is
+   completely wrong.)
+2. A crosshair walks through 5 targets: top-left → top-right →
+   bottom-right → bottom-left → center. Tap each centre carefully.
+3. A 2×3 affine matrix is fit by least-squares. Each tap's residual is
+   checked against the fitted model; if **any single point's error exceeds
+   35 px**, the mapping is rejected (`calibration failed — NN px error. 5
+   taps to retry`) and nothing is saved. Good runs show
+   `calibration saved (max err N px)`.
+
+Saved matrices live at `/etc/tailpipe/touch-cal.json` and load on startup.
+If no calibration file is present, the dashboard falls back to a named
+rotation (default 270°, override with `TAILPIPE_TOUCH_ROTATE=0|90|180|270`).
+While the wizard is open, the 5-rapid-taps entry gesture is suppressed so
+you can't accidentally reset mid-run.
+
+### Dashboard env vars
+
+| Variable                 | Default     | Meaning                                                   |
+|--------------------------|-------------|-----------------------------------------------------------|
+| `TAILPIPE_FB`            | `auto`      | Framebuffer path (`auto` scans for fb_ili9486).           |
+| `TAILPIPE_LAN_IFACE`     | `eth0`      | Which interface's bandwidth to display as "eth0".         |
+| `TAILPIPE_WAN_IFACE`     | `wlan0`     | Uplink interface name (for bandwidth + QR URL host).      |
+| `TAILPIPE_TS_BIND`       | `0.0.0.0`   | Address the phone-UI HTTP server binds to.                |
+| `TAILPIPE_TS_PORT`       | `8080`      | TCP port for the phone-UI HTTP server.                    |
+| `TAILPIPE_TOUCH_ROTATE`  | `270`       | Rotation fallback when no calibration file is present.    |
+| `TAILPIPE_LAN_SUBNET`    | `192.168.50.0/24` | Advertised via `tailscale up` during re-auth.       |
+
+Set via `systemctl edit tailpipe-dashboard` (adds a drop-in override).
+
+---
 
 ## Uninstall
 
 ```bash
-sudo ./uninstall.sh
+sudo ./uninstall.sh                   # reverts the core gateway
+sudo ./uninstall.sh --dashboard       # also removes the LCD dashboard
 ```
 
-Reverts everything except the Tailscale package itself. Use
-`sudo apt-get purge tailscale` if you want that gone too.
+Both leave the Tailscale package itself in place. Run
+`sudo apt-get purge tailscale` separately if you want that gone too.
 
 ## License
 
