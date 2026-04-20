@@ -10,7 +10,7 @@ Service gates itself on /dev/fb1 existing (systemd ConditionPathExists), so
 installing the dashboard on a pi without an LCD is a no-op at runtime.
 """
 import os, sys, time, mmap, json, subprocess, threading, signal, secrets, re
-import http.server, urllib.parse, html as html_escape
+import http.server, urllib.parse, html as html_escape, socket
 from collections import deque
 from PIL import Image, ImageDraw, ImageFont
 import evdev
@@ -514,6 +514,72 @@ def read_leases():
         pass
     return out
 
+# ---- reverse DNS -----------------------------------------------------------
+#
+# For destinations that aren't tailnet peers (already in /etc/hosts.tailscale)
+# or LAN clients (already in dnsmasq leases), do background PTR lookups so
+# public IPs show up as something like "amazonaws.com" instead of a raw dot
+# quad. Cached forever once resolved (or once we know there's no PTR).
+
+_rdns_cache = {}
+_rdns_pending = set()
+_rdns_lock = threading.Lock()
+
+def _shorten_hostname(name):
+    """Collapse 'ec2-44-215-138-159.compute-1.amazonaws.com' to 'amazonaws.com'.
+    Keeps the last two labels — enough to identify a service."""
+    parts = name.rstrip('.').split('.')
+    if len(parts) >= 2:
+        return '.'.join(parts[-2:]).lower()
+    return (name or '').lower()
+
+def _rdns_worker():
+    # getent uses the system resolver (dnsmasq forwards, falls through to the
+    # pi's upstream DNS). subprocess lets us bound each lookup independently
+    # with a timeout, avoiding socket.gethostbyaddr's process-wide defaults.
+    while True:
+        time.sleep(2)
+        with _rdns_lock:
+            batch = list(_rdns_pending)[:8]
+            for ip in batch:
+                _rdns_pending.discard(ip)
+        for ip in batch:
+            name = ''
+            try:
+                r = subprocess.run(['getent', 'hosts', ip],
+                                    capture_output=True, text=True, timeout=2)
+                if r.returncode == 0 and r.stdout:
+                    parts = r.stdout.split()
+                    if len(parts) >= 2:
+                        name = _shorten_hostname(parts[1])
+            except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+                pass
+            with _rdns_lock:
+                _rdns_cache[ip] = name
+
+def build_name_lookup(ts_hosts, leases, self_ip, self_name):
+    """Merge all the fast, authoritative sources into one dict used in the
+    draw path. Order of preference: tailnet peers, self (pi) IPs, LAN
+    DHCP leases. rDNS is looked up separately (async)."""
+    names = dict(ts_hosts)
+    if self_ip and self_ip != '-':
+        names[self_ip] = self_name
+    for l in leases:
+        n = (l.get('name') or '').strip()
+        if n and n != '*':
+            names[l['ip']] = n.lower()
+    return names
+
+def resolve_display_name(ip, names):
+    if ip in names:
+        return names[ip]
+    with _rdns_lock:
+        if ip in _rdns_cache:
+            cached = _rdns_cache[ip]
+            return cached if cached else ip
+        _rdns_pending.add(ip)
+    return ip
+
 def read_tailnet_hosts(path='/etc/hosts.tailscale'):
     """Return {ip: shortname} parsed from the addn-hosts file so destinations
     shown in the clients panel can be labelled with tailnet hostnames rather
@@ -645,7 +711,7 @@ def draw_clients(d, state):
     y0 = 118
     leases = state['leases']
     flows = state.get('client_flows', {})
-    ts_hosts = state.get('ts_hosts', {})
+    names = state.get('name_lookup', {})
     d.text((8, y0), f'CONNECTED  ({len(leases)})', font=F_MD, fill=ACCENT)
     d.text((160, y0 + 2), 'ip              name                    flows',
            font=F_SM, fill=DIM)
@@ -659,8 +725,7 @@ def draw_clients(d, state):
             proto_tag = ','.join(sorted(g['protos']))[:12]
             d.text((8, y), f'{l["ip"]:<15} {name:<22} {g["flows"]}/{proto_tag}',
                    font=F_SM, fill=FG)
-            # top destinations, name-resolved where possible
-            top = [f'{ts_hosts.get(ip, ip)}' for ip, _ in g['dests'].most_common(4)]
+            top = [resolve_display_name(ip, names) for ip, _ in g['dests'].most_common(4)]
             line = ', '.join(top)
             if len(line) > 60:
                 line = line[:59] + '.'
@@ -951,6 +1016,7 @@ def main():
         print('no LCD framebuffer detected; exiting.', file=sys.stderr); sys.exit(0)
     fb = FB(FB_DEV)
     start_control_server()
+    threading.Thread(target=_rdns_worker, daemon=True).start()
     touch_dev = find_touch()
     touch = Touch(touch_dev, W, H, matrix=load_calibration()) if touch_dev else None
     wlan = Rate(WAN_IFACE); eth = Rate(LAN_IFACE); ts = Rate(TS_IFACE)
@@ -979,6 +1045,9 @@ def main():
                 if state['lan_ip'] not in ('-', '') else '192.168.50.'
             state['client_flows'] = read_client_flows(lan_prefix)
             state['ts_hosts'] = read_tailnet_hosts()
+            state['name_lookup'] = build_name_lookup(
+                state['ts_hosts'], state['leases'],
+                state['lan_ip'], os.uname().nodename)
             last_slow = now
         if touch:
             for kind, sx, sy, rx, ry in touch.poll():
