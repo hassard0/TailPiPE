@@ -514,6 +514,31 @@ def read_leases():
         pass
     return out
 
+# ARP states that indicate the client is (or very recently was) reachable.
+# FAILED and INCOMPLETE mean we tried and couldn't; absence of a record
+# means we've never talked to that IP since boot. Either way = offline.
+_ONLINE_NEIGH_STATES = frozenset(('REACHABLE', 'STALE', 'DELAY', 'PROBE',
+                                  'PERMANENT', 'NOARP'))
+
+def read_eth_neighbors(iface):
+    """Return {ip: state} from `ip -4 neigh show dev <iface>`. Used to
+    separate "currently connected" from "lease file has a stale entry"
+    — dnsmasq.leases keeps records for the full 12 h lease lifetime, so
+    a disconnected client reappears every time the pi reboots."""
+    out = {}
+    try:
+        r = subprocess.run(['ip', '-4', 'neigh', 'show', 'dev', iface],
+                            capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        return out
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            ip = parts[0]
+            state = parts[-1] if parts[-1].isupper() else 'NONE'
+            out[ip] = state
+    return out
+
 # ---- reverse DNS -----------------------------------------------------------
 #
 # For destinations that aren't tailnet peers (already in /etc/hosts.tailscale)
@@ -1050,7 +1075,15 @@ def main():
         wlan.tick(); eth.tick(); ts.tick()
         if now - last_slow >= 3:
             state['lan_ip'] = ip4(LAN_IFACE); state['ts_ip'] = tailscale_ip()
-            state['wifi'] = wifi_status(); state['leases'] = read_leases()
+            state['wifi'] = wifi_status()
+            # Only count a lease as "connected" if the client is still
+            # present in the ARP table on the LAN interface — otherwise
+            # a 12 h lease file keeps resurrecting the laptop across
+            # disconnects and reboots.
+            all_leases = read_leases()
+            neighbors = read_eth_neighbors(LAN_IFACE)
+            state['leases'] = [l for l in all_leases
+                                if neighbors.get(l['ip']) in _ONLINE_NEIGH_STATES]
             # Derive the LAN prefix from LAN_IP (trim the last octet) so flow
             # filtering works regardless of subnet customisation.
             lan_prefix = '.'.join(state['lan_ip'].split('.')[:3]) + '.' \
@@ -1058,7 +1091,7 @@ def main():
             state['client_flows'] = read_client_flows(lan_prefix)
             state['ts_hosts'] = read_tailnet_hosts()
             state['name_lookup'] = build_name_lookup(
-                state['ts_hosts'], state['leases'],
+                state['ts_hosts'], all_leases,
                 state['lan_ip'], os.uname().nodename)
             last_slow = now
         if touch:

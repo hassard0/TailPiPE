@@ -163,8 +163,10 @@ option; the installer pulls `conntrack-tools` for this.
 - **Header**: hostname, LAN IP, tailnet IP, current wifi SSID + signal bars.
 - **Bandwidth**: live RX/TX for `wlan0`, `eth0`, and `tailscale0` with
   60-second spark lines.
-- **Connected clients**: current dnsmasq DHCP leases plus a live per-client
-  activity line showing flow count, protocols, and the top destinations.
+- **Connected clients**: DHCP leases filtered by ARP reachability (a stale
+  12-hour lease file entry won't resurface after the client disconnects),
+  plus a live per-client activity line showing flow count, protocols, and
+  the top destinations.
   Destinations are name-resolved — tailnet peers via `/etc/hosts.tailscale`
   (`100.67.189.24` → `pluto`), LAN clients via their DHCP hostname, and
   anything else via background rDNS (`44.215.138.159` →
